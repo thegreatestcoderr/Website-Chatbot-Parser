@@ -1,0 +1,21 @@
+<DOCTYPE html>
+<html>
+    <head>
+
+    </head>
+    <body>
+        <h1>Math Term Generator</h1>
+        <div id="word">Click the button to generate</div>
+        <button onclick="generate()">Generate</button>
+        <script>
+            const terms = [
+                "Add", "Subtract","Multiply","Divide","Exponent","Square Root","Function"
+            ];
+            function generate(){
+                const random = Math.floor(Math.random() * terms.length);
+                document.getElementById("word").textContent = terms[random];
+    }
+            
+        </script>
+    </body>
+</html>
