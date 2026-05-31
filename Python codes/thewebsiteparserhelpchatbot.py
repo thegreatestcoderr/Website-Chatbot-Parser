@@ -4,17 +4,24 @@ from bs4 import BeautifulSoup
 from urllib.parse import urljoin, urlparse
 from collections import deque
 from dotenv import load_dotenv
-from langchain_google_genai import ChatGoogleGenerativeAI
+
+from langchain_text_splitters import RecursiveCharacterTextSplitter
+from langchain_chroma import Chroma
+from langchain_google_genai import (
+    ChatGoogleGenerativeAI,
+    GoogleGenerativeAIEmbeddings,
+)
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.output_parsers import StrOutputParser
 
 
+# ---------- 1. Crawl website ----------
 
 def crawl_website(start_url, max_pages=50):
     visited = set()
     queue = deque([start_url])
     domain = urlparse(start_url).netloc
-    all_text = []
+    pages = []
 
     while queue and len(visited) < max_pages:
         url = queue.popleft()
@@ -32,11 +39,12 @@ def crawl_website(start_url, max_pages=50):
         visited.add(url)
         soup = BeautifulSoup(response.text, "html.parser")
 
-        
-        page_text = soup.get_text(separator="\n", strip=True)
-        all_text.append(f"\n\n=== PAGE: {url} ===\n\n{page_text}\n")
+        text = soup.get_text(separator="\n", strip=True)
+        if not text:
+            continue
 
-        
+        pages.append({"url": url, "text": text})
+
         for link in soup.find_all("a", href=True):
             href = link["href"]
             full_url = urljoin(url, href)
@@ -45,66 +53,94 @@ def crawl_website(start_url, max_pages=50):
             if parsed.netloc == domain and full_url not in visited:
                 queue.append(full_url)
 
-    return "\n".join(all_text)
+    return pages
 
 
-def save_website_text(text, filename="website_text.txt"):
-    with open(filename, "w", encoding="utf-8") as f:
-        f.write(text)
-    print(f"\nSaved website text to {filename}\n")
+# ---------- 2. Chunk + embed + store in vector DB ----------
 
-
-
-
-def load_website_text():
-    try:
-        with open('website_text.txt', 'r', encoding='utf-8') as f:
-            return f.read()
-    except Exception as e:
-        print(f"Error loading website_text.txt: {e}")
-        exit(1)
-
-
-def build_chatbot(website_text):
-    template = f"""
-You are an expert assistant whose job is to answer questions *only* using the information
-found in the following website content.
-
-Website Content:
-{website_text}
-
-Rules:
-- If the answer is not found in the website content, say:
-  "I can only answer questions based on the website information I have."
-- Do NOT invent or guess.
-- Stay strictly within the provided content.
-
-Question: {{question}}
-Answer:
-"""
-
-    prompt = ChatPromptTemplate.from_template(template)
-
-    llm = ChatGoogleGenerativeAI(
-        model='gemini-1.5-pro',
-        temperature=0.2
+def build_vector_store(pages, persist_dir="chroma_db"):
+    splitter = RecursiveCharacterTextSplitter(
+        chunk_size=800,
+        chunk_overlap=100,
     )
 
-    return prompt | llm | StrOutputParser()
+    texts = []
+    metadatas = []
+
+    for page in pages:
+        chunks = splitter.split_text(page["text"])
+        for chunk in chunks:
+            texts.append(chunk)
+            metadatas.append({"url": page["url"]})
+
+    embeddings = GoogleGenerativeAIEmbeddings(model="models/embedding-001")
+
+    db = Chroma(
+        collection_name="website_rag",
+        embedding_function=embeddings,
+        persist_directory=persist_dir,
+    )
+
+    print(f"Adding {len(texts)} chunks to vector store...")
+    db.add_texts(texts=texts, metadatas=metadatas)
+    db.persist()
+
+    return db
 
 
-def chat_loop(llm_chain):
-    print("Website Assistant is ready! Ask anything about the website. (Type 'exit' to quit)")
+# ---------- 3. Build RAG chain ----------
+
+def build_rag_chain(vector_store):
+    retriever = vector_store.as_retriever(search_kwargs={"k": 4})
+
+    system_template = """
+You are an expert assistant that answers questions using ONLY the provided context.
+
+Context:
+{context}
+
+Rules:
+- If the answer is not in the context, say:
+  "I can only answer questions based on the website information I have."
+- Do NOT invent or guess.
+- Cite relevant parts of the context when helpful.
+"""
+
+    prompt = ChatPromptTemplate.from_messages(
+        [
+            ("system", system_template),
+            ("human", "Question: {question}\nAnswer:"),
+        ]
+    )
+
+    llm = ChatGoogleGenerativeAI(
+        model="gemini-1.5-pro",
+        temperature=0.2,
+    )
+
+    def rag_chain(question: str) -> str:
+        docs = retriever.get_relevant_documents(question)
+        context = "\n\n---\n\n".join(d.page_content for d in docs)
+        chain = prompt | llm | StrOutputParser()
+        return chain.invoke({"context": context, "question": question})
+
+    return rag_chain
+
+
+# ---------- 4. Chat loop ----------
+
+def chat_loop(rag_fn):
+    print("RAG Website Assistant ready! (type 'exit' to quit)")
     while True:
-        user_input = input("You: ")
-        if user_input.lower() == "exit":
-            print("Website Assistant: Goodbye!")
+        q = input("You: ")
+        if q.lower().strip() == "exit":
+            print("Assistant: Goodbye!")
             break
+        answer = rag_fn(q)
+        print(f"\nAssistant: {answer}\n")
 
-        answer = llm_chain.invoke({"question": user_input})
-        print(f"Website Assistant: {answer}\n")
 
-
+# ---------- 5. Main ----------
 
 if __name__ == "__main__":
     load_dotenv()
@@ -117,12 +153,16 @@ if __name__ == "__main__":
     target_url = input("> ").strip()
 
     print("\nStarting crawl...\n")
-    website_text = crawl_website(target_url, max_pages=50)
+    pages = crawl_website(target_url, max_pages=50)
 
-    save_website_text(website_text)
+    if not pages:
+        print("No pages scraped. Exiting.")
+        exit(1)
 
-    print("Loading website into chatbot...\n")
-    text = load_website_text()
-    chatbot = build_chatbot(text)
+    print("\nBuilding vector store...\n")
+    db = build_vector_store(pages)
 
-    chat_loop(chatbot)
+    print("\nBuilding RAG chain...\n")
+    rag = build_rag_chain(db)
+
+    chat_loop(rag)
